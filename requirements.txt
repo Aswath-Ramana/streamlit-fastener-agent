@@ -5,6 +5,7 @@ python-multipart
 pandas
 faiss-cpu
 python-dotenv
+openpyxl
 langchain-core
 pydantic
 langchain
