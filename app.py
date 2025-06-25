@@ -30,8 +30,8 @@ load_dotenv()
 st.set_page_config(page_title="Groq Fastener Agent", layout="centered")
 st.title("🔩 Groq-Powered Fastener Agent")
 
-# --- I. STATE & INITIALIZATION ---
-
+# --- I. STATE & INITIALIZATION (Unchanged) ---
+# ... (all the initialization code from the previous correct version)
 if "messages" not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hello! I'm powered by Groq for lightning-fast responses. Ask me anything or upload a file for bulk matching."}]
 if "results_df" not in st.session_state:
@@ -42,13 +42,11 @@ def initialize_matching_engine():
     print("Initializing Matching Engine with Groq...")
     llm, index, df = None, None, None
     groq_api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
-
     if groq_api_key:
         llm = ChatGroq(model_name="llama3-8b-8192", temperature=0.1, api_key=groq_api_key)
         print("✅ Groq LLM Initialized for matching.")
     else:
         print("⚠️ `GROQ_API_KEY` not found. All LLM features will be disabled.")
-
     try:
         if os.path.exists("local_search_assets/faiss_index.bin") and os.path.exists("local_search_assets/master_metadata.parquet"):
             index = faiss.read_index("local_search_assets/faiss_index.bin")
@@ -72,19 +70,30 @@ class MatchResultYAML(BaseModel):
     item_number: str = Field(description="The unique item number of the matched product.")
     sales_description: str = Field(description="The full sales description.")
     confidence: str = Field(description="The confidence level: High, Medium, or Low.")
-    justification: str = Field(description="A brief explanation of the match.")
+    justification: str = Field(description="A brief explanation of the match, including why it was chosen over other candidates if applicable.")
 
 def get_llm_decision(query: str, candidates_df: pd.DataFrame):
     if not IS_MATCHER_ENABLED: return {"decision": "Error", "details": "Matcher not configured."}
-    if candidates_df.empty: return {"decision": "New Item", "details": "No semantic or fuzzy candidates found."}
+    if candidates_df.empty: return {"decision": "New Item", "details": "No plausible candidates found after search."}
+    
     candidates_str = candidates_df[['Item', 'Sales-Description']].to_string(index=False)
     parser = PydanticOutputParser(pydantic_object=MatchResultYAML)
+    
+    # --- CHANGE #1: A more flexible and powerful prompt ---
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an expert AI assistant... {format_instructions}"),
+        ("system", "You are an expert AI assistant for industrial parts. Your goal is to find the single best match for a user's 'Query' from a list of 'Candidates'.\n"
+                   "- Analyze the query and candidates carefully, looking at dimensions, materials, and type.\n"
+                   "- Choose the single best candidate, even if the match isn't perfect.\n"
+                   "- Assign a confidence level (High, Medium, or Low) based on how certain you are.\n"
+                   "- Provide a brief justification for your choice.\n"
+                   "- If absolutely NO candidate is a reasonable match, and only then, respond with the single phrase: 'New Item'.\n\n"
+                   "{format_instructions}"),
         ("human", "Query: \"{query}\"\n\nCandidates:\n{candidates}\n\nDecision:")
     ])
+    
     chain = prompt | matcher_llm | StrOutputParser()
     raw_output = chain.invoke({"query": query, "candidates": candidates_str, "format_instructions": parser.get_format_instructions()})
+    
     try:
         cleaned_output = raw_output.strip().replace("```json", "").replace("```", "")
         return {"decision": "Match", "details": parser.parse(cleaned_output)}
@@ -93,15 +102,11 @@ def get_llm_decision(query: str, candidates_df: pd.DataFrame):
 
 
 # --- III. MAIN UI & LOGIC ---
-
 if st.session_state.results_df is not None:
     st.header("🤖 Bulk Match Results")
-    # Display the processing time if it exists
     if "processing_time" in st.session_state:
         st.success(f"✅ Processed {len(st.session_state.results_df)} rows in {st.session_state.processing_time:.2f} seconds.")
-    
     st.dataframe(st.session_state.results_df, use_container_width=True)
-    
     @st.cache_data
     def convert_df_to_excel(df):
         output = io.BytesIO()
@@ -110,9 +115,7 @@ if st.session_state.results_df is not None:
         return output.getvalue()
     excel_data = convert_df_to_excel(st.session_state.results_df)
     st.download_button("📥 Download Results", excel_data, "matched_orders.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    
     if st.button("⬅️ Back to Chat"):
-        # Clear results and processing time for the next run
         st.session_state.results_df = None
         if "processing_time" in st.session_state:
             del st.session_state.processing_time
@@ -123,26 +126,12 @@ else:
             st.markdown(message["content"])
 
 # --- IV. UNIFIED ACTION AREA ---
-
-# The chat input is now at the top of the action area
-prompt = st.chat_input(
-    "Ask a question...", 
-    disabled=not IS_LLM_ENABLED
-)
-
-# The file uploader is now below the chat input
-uploaded_file = st.file_uploader(
-    "Or upload a file for bulk matching:",
-    type=["xlsx", "xls"],
-    disabled=not IS_MATCHER_ENABLED
-)
+prompt = st.chat_input("Ask a question...", disabled=not IS_LLM_ENABLED)
+uploaded_file = st.file_uploader("Or upload a file for bulk matching:", type=["xlsx", "xls"], disabled=not IS_MATCHER_ENABLED)
 
 
 # --- V. PROCESSING LOGIC ---
-
-# A. Handle File Upload Processing
 if uploaded_file is not None:
-    # 1. Start the timer
     start_time = time.time()
     st.session_state.messages = [{"role": "assistant", "content": f"Processing `{uploaded_file.name}`. Please wait."}]
     
@@ -157,36 +146,47 @@ if uploaded_file is not None:
         for i, row in enumerate(order_df.itertuples(index=False)):
             query, result_row = queries[i], row._asdict()
             query_vec = all_embeddings[i].reshape(1, -1)
-            semantic_indices, _ = search_top_k(local_index, query_vec, k=3)
-            fuzz_matches = fuzzy_match(query, sales_desc_choices, limit=2)
+            
+            # --- CHANGE #2: Widen the search for more candidates ---
+            semantic_indices, _ = search_top_k(local_index, query_vec, k=5) # Increased from 3 to 5
+            
+            # Use the updated fuzzy_match with a score cutoff
+            fuzz_matches = fuzzy_match(query, sales_desc_choices, limit=5, score_cutoff=60) # Increased limit, added cutoff
+            
             fuzz_indices = [m[2] for m in fuzz_matches]
-            all_candidates = master_df.iloc[list(set(semantic_indices.tolist() + fuzz_indices))].copy()
+            
+            # Combine unique indices from both search methods
+            combined_indices = list(set(semantic_indices.tolist() + fuzz_indices))
+            
+            all_candidates = master_df.iloc[combined_indices].copy()
+            
             decision_result = get_llm_decision(query, all_candidates)
+            
             if decision_result["decision"] == "Match":
                 result_row.update(decision_result["details"].dict())
             else:
-                result_row.update({"Matched Item": "New Item", "Confidence": "N/A", "Justification": decision_result.get("details", "No match found.")})
+                result_row.update({"Matched Item": "New Item", "Confidence": "N/A", "Justification": decision_result.get("details", "No plausible match found.")})
             results.append(result_row)
             progress_bar.progress((i + 1) / total_rows, text=f"Matching row {i+1}/{total_rows}")
+
+            # Add a small delay to avoid hitting the API rate limit.
+            # 0.2 seconds is a good starting point.
+            time.sleep(0.2) 
         
         st.session_state.results_df = pd.DataFrame(results)
-        
-        # 2. Stop the timer and store the duration
         end_time = time.time()
         st.session_state.processing_time = end_time - start_time
         
     st.rerun()
 
-# B. Handle Chat Input
 if prompt:
+    # (Chat logic remains unchanged)
     st.session_state.results_df = None
     if "processing_time" in st.session_state:
         del st.session_state.processing_time
     st.session_state.messages.append({"role": "user", "content": prompt})
-    
     with st.chat_message("user"):
         st.markdown(prompt)
-    
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
@@ -202,6 +202,5 @@ if prompt:
         except Exception as e:
             full_response = f"🚨 An error occurred with Groq: {e}"
             message_placeholder.error(full_response)
-            
     st.session_state.messages.append({"role": "assistant", "content": full_response})
     st.rerun()

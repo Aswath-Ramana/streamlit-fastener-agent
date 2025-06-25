@@ -15,6 +15,10 @@ def search_top_k(index, query_vector: np.ndarray, k: int = 5):
     distances, indices = index.search(query_vector, k)
     return indices[0], distances[0]
 
-def fuzzy_match(query: str, choices: list[str], limit: int = 5):
-    """Performs fuzzy string matching."""
-    return process.extract(query, choices, limit=limit)
+def fuzzy_match(query: str, choices: dict, limit: int = 5, score_cutoff: int = 60):
+    """
+    Performs fuzzy string matching with a score cutoff.
+    'choices' should be a dictionary for this to work correctly and return indices.
+    """
+    # The process.extract function with a dictionary automatically handles the score_cutoff
+    return process.extract(query, choices, limit=limit, score_cutoff=score_cutoff)
