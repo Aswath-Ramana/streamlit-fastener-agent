@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import faiss
 import os
+import io
 import time
 import groq
 from dotenv import load_dotenv
@@ -40,8 +41,10 @@ if "results_df" not in st.session_state:
 def initialize_matching_engine():
     print("Initializing Matching Engine with Groq...")
     llm, index, df = None, None, None
-    if "GROQ_API_KEY" in os.environ and os.environ.get("GROQ_API_KEY"):
-        llm = ChatGroq(model_name="llama3-8b-8192", temperature=0.1)
+    groq_api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
+
+    if groq_api_key:
+        llm = ChatGroq(model_name="llama3-8b-8192", temperature=0.1, api_key=groq_api_key)
         print("✅ Groq LLM Initialized for matching.")
     else:
         print("⚠️ `GROQ_API_KEY` not found. All LLM features will be disabled.")
@@ -64,7 +67,7 @@ IS_LLM_ENABLED = matcher_llm is not None
 IS_MATCHER_ENABLED = IS_LLM_ENABLED and local_index is not None and master_df is not None
 
 
-# --- II. HELPER FUNCTIONS & Pydantic Models (Unchanged) ---
+# --- II. HELPER FUNCTIONS & Pydantic Models ---
 class MatchResultYAML(BaseModel):
     item_number: str = Field(description="The unique item number of the matched product.")
     sales_description: str = Field(description="The full sales description.")
@@ -77,7 +80,7 @@ def get_llm_decision(query: str, candidates_df: pd.DataFrame):
     candidates_str = candidates_df[['Item', 'Sales-Description']].to_string(index=False)
     parser = PydanticOutputParser(pydantic_object=MatchResultYAML)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an expert AI assistant. Your task is to determine if the user's 'Query' matches one of the provided 'Candidates'.\n- If you find a confident match, format your answer according to the instructions.\n- If there is no clear match, respond with the single phrase: 'New Item'.\n\n{format_instructions}"),
+        ("system", "You are an expert AI assistant... {format_instructions}"),
         ("human", "Query: \"{query}\"\n\nCandidates:\n{candidates}\n\nDecision:")
     ])
     chain = prompt | matcher_llm | StrOutputParser()
@@ -91,59 +94,59 @@ def get_llm_decision(query: str, candidates_df: pd.DataFrame):
 
 # --- III. MAIN UI & LOGIC ---
 
-# Display either results table or chat history
 if st.session_state.results_df is not None:
     st.header("🤖 Bulk Match Results")
+    # Display the processing time if it exists
+    if "processing_time" in st.session_state:
+        st.success(f"✅ Processed {len(st.session_state.results_df)} rows in {st.session_state.processing_time:.2f} seconds.")
+    
     st.dataframe(st.session_state.results_df, use_container_width=True)
     
     @st.cache_data
     def convert_df_to_excel(df):
-        import io
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df.to_excel(writer, index=False, sheet_name='Matched_Orders')
         return output.getvalue()
-
     excel_data = convert_df_to_excel(st.session_state.results_df)
-    st.download_button(
-        label="📥 Download Results as Excel",
-        data=excel_data,
-        file_name="matched_orders.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    st.download_button("📥 Download Results", excel_data, "matched_orders.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
     if st.button("⬅️ Back to Chat"):
+        # Clear results and processing time for the next run
         st.session_state.results_df = None
+        if "processing_time" in st.session_state:
+            del st.session_state.processing_time
         st.rerun()
 else:
-    # Display chat messages from history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
 # --- IV. UNIFIED ACTION AREA ---
-st.divider()
 
-# --- THE UI IMPROVEMENT IS HERE ---
-# Chat input remains below for a unified experience
+# The chat input is now at the top of the action area
 prompt = st.chat_input(
-    "Or ask a question...", 
+    "Ask a question...", 
     disabled=not IS_LLM_ENABLED
 )
 
-# We use a clear, button-like label for the file uploader.
+# The file uploader is now below the chat input
 uploaded_file = st.file_uploader(
-    "**Upload a file for Bulk Matching**",
+    "Or upload a file for bulk matching:",
     type=["xlsx", "xls"],
     disabled=not IS_MATCHER_ENABLED
-    #label_visibility="visible" # Ensure the new label is shown
 )
+
 
 # --- V. PROCESSING LOGIC ---
 
 # A. Handle File Upload Processing
 if uploaded_file is not None:
+    # 1. Start the timer
+    start_time = time.time()
     st.session_state.messages = [{"role": "assistant", "content": f"Processing `{uploaded_file.name}`. Please wait."}]
-    with st.spinner(f"Processing `{uploaded_file.name}`... This may take a moment."):
+    
+    with st.spinner(f"Processing `{uploaded_file.name}`..."):
         order_df = pd.read_excel(uploaded_file)
         total_rows, results = len(order_df), []
         queries = order_df.iloc[:, 1].fillna('').astype(str).tolist()
@@ -160,32 +163,38 @@ if uploaded_file is not None:
             all_candidates = master_df.iloc[list(set(semantic_indices.tolist() + fuzz_indices))].copy()
             decision_result = get_llm_decision(query, all_candidates)
             if decision_result["decision"] == "Match":
-                details = decision_result["details"]
-                result_row.update({"Matched Item": details.item_number, "Confidence": details.confidence, "Justification": details.justification})
+                result_row.update(decision_result["details"].dict())
             else:
                 result_row.update({"Matched Item": "New Item", "Confidence": "N/A", "Justification": decision_result.get("details", "No match found.")})
             results.append(result_row)
             progress_bar.progress((i + 1) / total_rows, text=f"Matching row {i+1}/{total_rows}")
         
         st.session_state.results_df = pd.DataFrame(results)
+        
+        # 2. Stop the timer and store the duration
+        end_time = time.time()
+        st.session_state.processing_time = end_time - start_time
+        
     st.rerun()
 
 # B. Handle Chat Input
 if prompt:
     st.session_state.results_df = None
+    if "processing_time" in st.session_state:
+        del st.session_state.processing_time
     st.session_state.messages.append({"role": "user", "content": prompt})
+    
     with st.chat_message("user"):
         st.markdown(prompt)
-
+    
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
         try:
+            groq_api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
             formatted_history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
-            client = groq.Groq(api_key=os.environ.get("GROQ_API_KEY"))
-            response_stream = client.chat.completions.create(
-                model="llama3-8b-8192", messages=formatted_history, stream=True
-            )
+            client = groq.Groq(api_key=groq_api_key)
+            response_stream = client.chat.completions.create(model="llama3-8b-8192", messages=formatted_history, stream=True)
             for chunk in response_stream:
                 full_response += chunk.choices[0].delta.content or ""
                 message_placeholder.markdown(full_response + "▌")
