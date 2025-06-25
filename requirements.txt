@@ -1,0 +1,15 @@
+# requirements.txt
+fastapi
+uvicorn
+python-multipart
+pandas
+faiss-cpu
+python-dotenv
+langchain-core
+pydantic
+langchain
+xlsxwriter
+sentence-transformers
+thefuzz
+groq
+langchain-groq
